@@ -7,19 +7,27 @@ import signal
 import time
 import os
 from urllib import parse
+import argparse
+
+HOST = '127.0.0.1'
+PORT = 8080
+DOCUMENT_ROOT = 'www'
 
 OK = 200
 NOT_FOUND = 404
+FORBIDDEN = 403
 BAD_REQUEST = 400
 NOT_ALLOWED = 405
 INTERNAL_SERVER_ERROR = 500
 HTTP_VERSION_NOT_SUPPORTED = 505
 HTML_ERROR = """<html>
 <head>
+<meta charset="UTF-8"> 
 <title>{status} - {text}</title>
 </head>
 <body>
-<h1>{status}</h1>
+<h1>¯\_(ツ)_/¯</h1>
+<h2>{status}</h2>
 <p>{text}</p>
 </body>
 </html>
@@ -32,10 +40,11 @@ class HelloServer:
     request: "My name is Alex"
     response: "Hello, Alex"
     """
-    def __init__(self, host, port):
+    def __init__(self, host, port, workers):
         self.host = host
         self.port = port
         self.read_size = 1024
+        self.workers = workers
 
     def start(self):
         """ Attempts to aquire the socket and launch the server """
@@ -55,12 +64,12 @@ class HelloServer:
         print("Server successfully acquired the socket with port:", self.port)
         print("Press Ctrl+C to shut down the server and exit.")
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            print('STARTING LISTEN')
-            future = executor.submit(self._listen, ('LISTEN ' + self._get_th_key(),))
-            future = executor.submit(self._listen, ('LISTEN ' + self._get_th_key(),))
-            future = executor.submit(self._listen, ('LISTEN ' + self._get_th_key(),))
-            print('LISTEN STARTED')
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            print('STARTING WORKERS')
+            for _ in range(self.workers):
+                executor.submit(self._listen, ('WORKER ' + self._get_th_key(),))
+            print('WORKERS STARTED')
+        #  FIXME почему поток выполнения никогда не достигает этой строчки??
         print("BEHIND WITH")
         # self._listen()
 
@@ -78,7 +87,6 @@ class HelloServer:
             key = self._get_th_key()
             print(f"{lkey}: START NEW THREAD WITH KEY", key)
             threading.Thread(target = self.listen_to_client, args = (client, address, key)).start()
-            print(f'{lkey}: ALL TASKS COMPLETE')
 
     def listen_to_client(self, client, address, key):
         print(f'{key} : STARTED NEW THREAD FOR {address}')
@@ -89,7 +97,6 @@ class HelloServer:
                 print(f'{key} : DATA IS: {data}')
                 if data:
                     response = self.get_response(data)
-                    print(f'{key} : RESPONSE IS: {response}')
                     client.send(response)
                 else:
                     raise socket.error('Client disconnected')
@@ -127,11 +134,21 @@ class HelloServer:
 
 
 class HTTPServer(HelloServer):
-    def __init__(self, host, port):
-        self.document_root = 'www'
+    def __init__(self, host, port, workers, document_root):
+        self.document_root = document_root
         self.delimiter = b'\r\n'
         self.ender = b'\r\n\r\n'
-        super().__init__(host, port)
+        # в настоящее время на каждое нажатие F5 в браузере сервер создает отдельный тред.
+        # и закрытия этих тредов что-то не видно. Есть параметр keep-alive, и вроде как если он есть
+        # соединение с этим браузером не должно отдаваться другому треду.
+        # непонятно как это реализовать. Пока ощущение, что плодиться куча тредов и они нихрена потом
+        # не закрываются нормально.
+        # кстати елси убрать Thread Pool - то сервер при закрытии вообще будет зависать,
+        # по-крайней мере из пайчарма так.
+        # Сейчас получается что у меня воркер треды, которые создают еще треды.
+        # Нормально ли это вообще? :)
+        self.close_connection = True
+        super().__init__(host, port, workers)
 
     def _read(self, client):
         maxsize = 65536
@@ -143,15 +160,36 @@ class HTTPServer(HelloServer):
         return data
 
     def _get_headers(self, data):
-        """Only \r\n delimiter syntax is supported"""
+        """Only \r\n delimiter syntax is supported ¯\_(ツ)_/¯
+           returns tuple:
+                headers: dict (empty if error while parsing headers
+                error: tuple(error_code, error_str) (empty if parsed without an error)
+        """
+        headers = dict()
+        headersline = str(data, 'iso-8859-1')
+        headersline = headersline.rstrip('\r\n')
+        headerslist = headersline.split('\r\n')
+        try:
+            firstline, add_headers = headerslist[0], headerslist[1:]
+            words = firstline.split()
+        except Exception as e:
+            return dict(), (BAD_REQUEST, "Bad request syntax (%r)" % headersline)
         command, path, version = '', '', ''
-        requestline = str(data, 'iso-8859-1')
-        requestline = requestline.rstrip('\r\n')
-        requestline = requestline.split('\r\n')[0]
-        words = requestline.split()
-        print('WORDS: ', words)
         if len(words) == 3:
             command, path, version = words
+        elif len(words) == 2:
+            command, path = words
+
+        headers['command'] = command
+        headers['path'] = path
+        headers['version'] = version
+        for line in add_headers:
+            key, value = line.split(': ')
+            headers[key] = value
+        print('HEADERS', headers)
+
+        if headers['version']:
+            version = headers['version']
             try:
                 if version[:5] != 'HTTP/':
                     raise ValueError
@@ -164,19 +202,14 @@ class HTTPServer(HelloServer):
                 return dict(), (BAD_REQUEST, "Bad request version (%r)" % version)
             if version_number >= (2, 0):
                 return dict(), (HTTP_VERSION_NOT_SUPPORTED, "Invalid HTTP version (%s)" % base_version_number)
-        elif len(words) == 2:
-            command, path = words
-        elif not words:
-            return dict(), (BAD_REQUEST,  "Bad request syntax (%r)" % requestline)
-        else:
-            return dict(), (BAD_REQUEST,  "Bad request syntax (%r)" % requestline)
-        if command not in ['GET', 'HEAD']:
-            return dict(), (NOT_ALLOWED, "Method not allowed: (%r)" % command)
-        headers = {
-            'command': command,
-            'path': path,
-            'request_version': version
-        }
+        if headers['command'] not in ['GET', 'HEAD']:
+            return dict(), (NOT_ALLOWED, "Method not allowed: (%r)" % headers['command'])
+        # conntype = headers.get('Connection', "")
+        # if conntype.lower() == 'close':
+        #     self.close_connection = True
+        # elif (conntype.lower() == 'keep-alive' and
+        #       headers['version'] >= "HTTP/1.1"):
+        #     self.close_connection = False
         return headers, tuple()
 
     def get_html_from_path(self, path):
@@ -191,37 +224,46 @@ class HTTPServer(HelloServer):
 
         return html
 
-    def resolve_path(self, path: str) -> str:
+    def resolve_path(self, path: str) -> tuple:
         print('PATH GETTED', path)
+        query = ''
+        if '?' in path:
+            path, query = path.split('?')
+        if '../' in path:
+            return '', ''
         if '%' in path:
             path = parse.unquote(path)
         if path == '/':
             path = os.path.join(self.document_root, 'index.html')
         else:
             path = self.document_root + path
-        print('PATH IS', path)
         if os.path.isdir(path):
             path = os.path.join(path, 'index.html')  # 'htm' extension is not supported
         print('END PATH', path)
-        return path
+        return path, query
 
     def _gen_headers(self, code, content_length, content_type):
         """ Generates HTTP response Headers."""
 
         # determine response code
         h = ''
+        # TODO: зарефакторить
         if code == 200:
             h = f'HTTP/1.1 200 OK\r\n'
         elif code == 404:
             h = f'HTTP/1.1 404 Not Found\r\n'
         elif code == 405:
             h = f'HTTP/1.1 405 Method Not Allowed\r\n'
+        elif code == 403:
+            h = f'HTTP/1.1 403 Forbidden\r\n'
+        else:
+            raise ValueError(f'Unexpected response code: {code}')
 
         # write further headers
         current_date = time.strftime("%a, %d %b %Y %H:%M:%S", time.localtime())
         h += 'Date: ' + current_date + '\r\n'
         h += 'Server: Simple-Python-HTTP-Server\r\n'
-        h += 'Connection: close\r\n'  # signal that the conection will be closed after complting the request
+        h += 'Connection: close\r\n'  # signal that the conection will be closed after compliting the request
         h += f'Content-Length: {content_length}\r\n'
         h += f'Content-Type: {content_type}\n\n'
 
@@ -229,8 +271,8 @@ class HTTPServer(HelloServer):
 
     def wrap_response(self, status: int, html: bytes, content_type='text/html', is_head=False):
         headers = self._gen_headers(status, len(html), content_type)
-        response = headers.encode() + html if not is_head else headers.encode()
-        print(response)
+        response = headers.encode() + html if not is_head else headers.encode() + b'\r\n\r\n'
+        print(f'RESPONSE HEADERS IS: {headers}')
         return response
 
     def get_content_type(self, path: str):
@@ -254,19 +296,42 @@ class HTTPServer(HelloServer):
         if error:
             status, text = error
             return self.wrap_response(status, HTML_ERROR.format(status=status, text=text).encode())
-        path = self.resolve_path(headers['path'])
+        path, query = self.resolve_path(headers['path'])
         content_type = self.get_content_type(path)
         html = self.get_html_from_path(path)
-        print('PATH: ', headers['path'])
-        print('HTML: ', html)
         is_head = headers['command'] == 'HEAD'
-        return self.wrap_response(OK, html, content_type=content_type, is_head=is_head) if html else \
-            self.wrap_response(NOT_FOUND, HTML_ERROR.format(status=NOT_FOUND, text='Page not found').encode(), is_head=is_head)
+        if html:
+            return self.wrap_response(OK, html, content_type=content_type, is_head=is_head)
+        elif not html and 'index.html' in path:
+            return self.wrap_response(FORBIDDEN, HTML_ERROR.format(status=FORBIDDEN, text='Forbidden').encode(),
+                                   is_head=is_head)
+        else:
+            return self.wrap_response(NOT_FOUND, HTML_ERROR.format(status=NOT_FOUND, text='Page not found').encode(),
+                                      is_head=is_head)
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-w', '--workers', default=4, type=int)
+    parser.add_argument('-r', '--documentroot', default=DOCUMENT_ROOT)
+    return parser
+
+
+def get_config() -> dict:
+    parser = create_parser()
+    namespace = parser.parse_args()
+    WORKERS = namespace.workers
+    DOCUMENT_ROOT = namespace.documentroot
+    return {
+        'WORKERS': WORKERS,
+        'DOCUMENT_ROOT': DOCUMENT_ROOT
+    }
 
 
 if __name__ == '__main__':
+    config = get_config()
     print ("Starting web server")
-    s = HTTPServer('127.0.0.1', 9999)  # construct server object
+    server = HTTPServer(HOST, PORT, config['WORKERS'], config['DOCUMENT_ROOT'])  # construct server object
     # shut down on ctrl+c
-    signal.signal(signal.SIGINT, s.shutdown)
-    s.start()  # aquire the socket
+    signal.signal(signal.SIGINT, server.shutdown)
+    server.start()  # aquire the socket
