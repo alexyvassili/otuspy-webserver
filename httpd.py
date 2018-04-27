@@ -9,6 +9,7 @@ import time
 import os
 from urllib import parse
 import argparse
+from collections import defaultdict
 
 LOGGING_FORMAT = '[%(asctime)s] %(levelname).1s %(message)s'
 LOGGING_LEVEL = logging.INFO
@@ -55,7 +56,7 @@ class HelloServer:
         self.workers = workers
         self.opened_threads = []
         self.closed_threads = []
-        self.threads_owners = dict()
+        self.subthreads_owners = defaultdict(list)
 
     def start(self):
         """ Attempts to aquire the socket and launch the server """
@@ -78,16 +79,16 @@ class HelloServer:
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
             logging.debug('STARTING WORKERS')
             for _ in range(self.workers):
-                key = self._get_th_key()
+                key = self._get_key()
                 worker_key = f'WORKER_{key}'
                 logging.info(f'Starting worker with key: {worker_key}')
                 executor.submit(self._listen, worker_key)
         logging.debug('WORKERS STARTED')
         #  FIXME почему поток выполнения никогда не достигает этой строчки??
-        logging.debug("BEHIND WITH")
+        logging.info("BEHIND WITH")
         # self._listen()
 
-    def _get_th_key(self):
+    def _get_key(self):
         return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(5))
 
     def _listen(self, worker_key):
@@ -98,29 +99,33 @@ class HelloServer:
             logging.debug(f'{worker_key}: ADDRESS: {address}')
             logging.debug(f'{worker_key}: SET TIMEOUT')
             client.settimeout(10)
-            key = self._get_th_key()
+            key = self._get_key()
             logging.info(f"{worker_key}: START NEW THREAD WITH KEY {key}")
-            threading.Thread(target = self.listen_to_client, args = (client, address, key)).start()
+            threading.Thread(target = self.listen_to_client, args = (client, address,worker_key, key)).start()
             self.opened_threads.append(key)
-            self.threads_owners[key] = worker_key
+            self.subthreads_owners[worker_key].append(key)
 
-    def listen_to_client(self, client, address, key):
-        logging.debug(f'{key} : STARTED NEW THREAD FOR {address}')
-        while True:
-            try:
-                logging.debug(f'{key} : GETTING DATA')
-                data = self._read(client)
-                logging.debug(f'{key} : DATA IS: {data}')
-                if data:
-                    response = self.get_response(data)
-                    client.send(response)
-                else:
-                    raise socket.error('Client disconnected')
-            except OSError as e:
-                logging.debug(f'{key} : CLIENT DISCONNECTED, EXITING')
+    def listen_to_client(self, client, address, worker_key,  thread_key):
+        logging.debug(f'{worker_key} : THREAD {thread_key} : STARTED NEW THREAD FOR {address}')
+        try:
+            logging.debug(f'{worker_key} : THREAD {thread_key} : GETTING DATA')
+            data = self._read(client)
+            logging.debug(f'{worker_key} : THREAD {thread_key} : DATA IS: {data}')
+            if data:
+                response = self.get_response(data)
+                # client.send(response) TODO: как лучше?
+                client.sendall(response)
+                logging.info(f'{worker_key} : THREAD {thread_key} : RESPONSE SENDED, EXITING')
                 client.close()
-                self.closed_threads.append(key)
-                return False
+                self.closed_threads.append(thread_key)
+                return True
+            else:
+                raise socket.error('Client disconnected')
+        except OSError as e:
+            logging.info(f'{worker_key} : THREAD {thread_key} : CLIENT DISCONNECTED, EXITING')
+            client.close()
+            self.closed_threads.append(thread_key)
+            return False
 
     def _read(self, client):
         data = client.recv(self.read_size)
@@ -149,6 +154,9 @@ class HelloServer:
         finally:
             logging.info(f'Opened threads: {len(self.opened_threads)}')
             logging.info(f'Closed threads: {len(self.closed_threads)}')
+            logging.info(f'Workers statistic: ')
+            for worker, threads in self.subthreads_owners.items():
+                logging.info(f'{worker} :: {len(threads)} threads.')
             sys.exit(exit_code)
 
 
@@ -163,6 +171,16 @@ class HTTPServer(HelloServer):
         # непонятно как это реализовать. Пока ощущение, что плодиться куча тредов и они нихрена потом
         # не закрываются нормально.
         # Косвенно на это указывает тот факт, что при апач тесте процесс сервера потихонечку разрастается в памяти.
+        # Хотя посчитал статистику - вроде ничего
+        # [2018.04.27 17:07:09] I Opened threads: 49967
+        # [2018.04.27 17:07:09] I Closed threads: 49961
+        # а время на запрос пишет - 10 секунд, значит все запросы отваливаются по таймауту!
+        # значит надо закрывать тред после каждого ответа
+        # сразу стали запросы по 20 мс выполняться
+        # и треды закрываются, но все-таки не все:
+        # [2018.04.27 17: 34:47] I Opened threads: 49910
+        # [2018.04.27 17:34:47] I Closed threads: 49902
+
         # кстати если убрать Thread Pool - то сервер при закрытии вообще будет зависать,
         # по-крайней мере из пайчарма так.
         # Сейчас получается что у меня воркер треды, которые создают еще треды.
