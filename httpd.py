@@ -4,10 +4,18 @@ import string
 import random
 import sys
 import signal
+import logging
 import time
 import os
 from urllib import parse
 import argparse
+
+LOGGING_FORMAT = '[%(asctime)s] %(levelname).1s %(message)s'
+LOGGING_LEVEL = logging.INFO
+LOGGING_FILE = None
+
+logging.basicConfig(format=LOGGING_FORMAT, datefmt='%Y.%m.%d %H:%M:%S', level=LOGGING_LEVEL,
+                            filename=LOGGING_FILE)
 
 HOST = '127.0.0.1'
 PORT = 8080
@@ -45,64 +53,73 @@ class HelloServer:
         self.port = port
         self.read_size = 1024
         self.workers = workers
+        self.opened_threads = []
+        self.closed_threads = []
+        self.threads_owners = dict()
 
     def start(self):
         """ Attempts to aquire the socket and launch the server """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            print("Launching HTTP server on ", self.host, ":", self.port)
+            logging.info(f"Launching HTTP server on {self.host} : {self.port}")
             self.sock.bind((self.host, self.port))
 
         except Exception as e:
-            print("ERROR: Failed to acquire sockets for port", self.port)
-            print("Try running the Server in a privileged user mode.")
+            logging.info(f"ERROR: Failed to acquire sockets for port {self.port}")
+            logging.info("Try running the Server in a privileged user mode.")
             self.shutdown()
             import sys
             sys.exit(1)
 
-        print("Server successfully acquired the socket with port:", self.port)
-        print("Press Ctrl+C to shut down the server and exit.")
+        logging.info(f"Server successfully acquired the socket with port: {self.port}")
+        logging.info("Press Ctrl+C to shut down the server and exit.")
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            print('STARTING WORKERS')
+            logging.debug('STARTING WORKERS')
             for _ in range(self.workers):
-                executor.submit(self._listen, ('WORKER ' + self._get_th_key(),))
-            print('WORKERS STARTED')
+                key = self._get_th_key()
+                worker_key = f'WORKER_{key}'
+                logging.info(f'Starting worker with key: {worker_key}')
+                executor.submit(self._listen, worker_key)
+        logging.debug('WORKERS STARTED')
         #  FIXME почему поток выполнения никогда не достигает этой строчки??
-        print("BEHIND WITH")
+        logging.debug("BEHIND WITH")
         # self._listen()
 
     def _get_th_key(self):
         return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(5))
 
-    def _listen(self, lkey):
+    def _listen(self, worker_key):
         self.sock.listen(5)
         while True:
-            print(f'{lkey}: ACCEPTING')
+            logging.debug(f'{worker_key}: ACCEPTING')
             client, address = self.sock.accept()
-            print(f'{lkey}: ADDRESS: ', address)
-            print(f'{lkey}: SET TIMEOUT')
+            logging.debug(f'{worker_key}: ADDRESS: {address}')
+            logging.debug(f'{worker_key}: SET TIMEOUT')
             client.settimeout(10)
             key = self._get_th_key()
-            print(f"{lkey}: START NEW THREAD WITH KEY", key)
+            logging.info(f"{worker_key}: START NEW THREAD WITH KEY {key}")
             threading.Thread(target = self.listen_to_client, args = (client, address, key)).start()
+            self.opened_threads.append(key)
+            self.threads_owners[key] = worker_key
 
     def listen_to_client(self, client, address, key):
-        print(f'{key} : STARTED NEW THREAD FOR {address}')
+        logging.debug(f'{key} : STARTED NEW THREAD FOR {address}')
         while True:
             try:
-                print(f'{key} : GETTING DATA')
+                logging.debug(f'{key} : GETTING DATA')
                 data = self._read(client)
-                print(f'{key} : DATA IS: {data}')
+                logging.debug(f'{key} : DATA IS: {data}')
                 if data:
                     response = self.get_response(data)
                     client.send(response)
                 else:
                     raise socket.error('Client disconnected')
             except OSError as e:
-                print(f'{key} : CLIENT DISCONNECTED, EXITING')
+                logging.debug(f'{key} : CLIENT DISCONNECTED, EXITING')
                 client.close()
+                self.closed_threads.append(key)
                 return False
 
     def _read(self, client):
@@ -122,14 +139,16 @@ class HelloServer:
         """ Shut down the server """
         exit_code = 0
         try:
-            print("Shutting down the server")
+            logging.info("Shutting down the server")
             self.sock.shutdown(socket.SHUT_RDWR)
 
         except Exception as e:
-            print("Warning: could not shut down the socket. Maybe it was already closed?", e)
+            logging.info(f"Warning: could not shut down the socket. Maybe it was already closed? {e}")
             exit_code = 1
 
         finally:
+            logging.info(f'Opened threads: {len(self.opened_threads)}')
+            logging.info(f'Closed threads: {len(self.closed_threads)}')
             sys.exit(exit_code)
 
 
@@ -143,10 +162,13 @@ class HTTPServer(HelloServer):
         # соединение с этим браузером не должно отдаваться другому треду.
         # непонятно как это реализовать. Пока ощущение, что плодиться куча тредов и они нихрена потом
         # не закрываются нормально.
-        # кстати елси убрать Thread Pool - то сервер при закрытии вообще будет зависать,
+        # Косвенно на это указывает тот факт, что при апач тесте процесс сервера потихонечку разрастается в памяти.
+        # кстати если убрать Thread Pool - то сервер при закрытии вообще будет зависать,
         # по-крайней мере из пайчарма так.
         # Сейчас получается что у меня воркер треды, которые создают еще треды.
         # Нормально ли это вообще? :)
+        # Еще сервак тормозит на тесте HEAD - видимо ждет конца пакета?
+        # непонятно, что ему нужно отдавать. Или Content-Length = 0 писать?
         self.close_connection = True
         super().__init__(host, port, workers)
 
@@ -186,7 +208,7 @@ class HTTPServer(HelloServer):
         for line in add_headers:
             key, value = line.split(': ')
             headers[key] = value
-        print('HEADERS', headers)
+        logging.debug(f'HEADERS: {headers}')
 
         if headers['version']:
             version = headers['version']
@@ -215,17 +237,17 @@ class HTTPServer(HelloServer):
     def get_html_from_path(self, path):
         html = b''
         try:
-            print('TRY OPEN FILE', path)
+            logging.debug(f'TRY OPEN FILE: {path}')
             with open(path, 'rb') as f:
                 html = f.read()
         except Exception as e:
-            print("EXCEPTION")
-            print(e.args)  # TODO: DEBUG MODE
+            logging.debug("EXCEPTION")
+            logging.debug(e.args)  # TODO: DEBUG MODE
 
         return html
 
     def resolve_path(self, path: str) -> tuple:
-        print('PATH GETTED', path)
+        logging.debug(f'PATH GETTED {path}')
         query = ''
         if '?' in path:
             path, query = path.split('?')
@@ -239,7 +261,7 @@ class HTTPServer(HelloServer):
             path = self.document_root + path
         if os.path.isdir(path):
             path = os.path.join(path, 'index.html')  # 'htm' extension is not supported
-        print('END PATH', path)
+        logging.debug(f'RESOLVED PATH: {path}')
         return path, query
 
     def _gen_headers(self, code, content_length, content_type):
@@ -272,7 +294,7 @@ class HTTPServer(HelloServer):
     def wrap_response(self, status: int, html: bytes, content_type='text/html', is_head=False):
         headers = self._gen_headers(status, len(html), content_type)
         response = headers.encode() + html if not is_head else headers.encode() + b'\r\n\r\n'
-        print(f'RESPONSE HEADERS IS: {headers}')
+        logging.debug(f'RESPONSE HEADERS IS: {headers}')
         return response
 
     def get_content_type(self, path: str):
@@ -312,6 +334,8 @@ class HTTPServer(HelloServer):
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--ip', default=HOST)
+    parser.add_argument('-p', '--port', default=PORT, type=int)
     parser.add_argument('-w', '--workers', default=4, type=int)
     parser.add_argument('-r', '--documentroot', default=DOCUMENT_ROOT)
     return parser
@@ -320,18 +344,18 @@ def create_parser() -> argparse.ArgumentParser:
 def get_config() -> dict:
     parser = create_parser()
     namespace = parser.parse_args()
-    WORKERS = namespace.workers
-    DOCUMENT_ROOT = namespace.documentroot
     return {
-        'WORKERS': WORKERS,
-        'DOCUMENT_ROOT': DOCUMENT_ROOT
+        'host': namespace.ip,
+        'port': namespace.port,
+        'workers': namespace.workers,
+        'document_root': namespace.documentroot,
     }
 
 
 if __name__ == '__main__':
     config = get_config()
-    print ("Starting web server")
-    server = HTTPServer(HOST, PORT, config['WORKERS'], config['DOCUMENT_ROOT'])  # construct server object
+    logging.info ("Starting web server")
+    server = HTTPServer(**config)  # construct server object
     # shut down on ctrl+c
     signal.signal(signal.SIGINT, server.shutdown)
     server.start()  # aquire the socket
