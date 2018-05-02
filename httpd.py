@@ -7,7 +7,7 @@ import signal
 import logging
 import time
 import os
-from urllib import parse
+from urlparse import  unquote
 import argparse
 from collections import defaultdict
 
@@ -55,8 +55,6 @@ class HelloServer:
         self.read_size = 1024
         self.workers = workers
         self.opened_threads = []
-        self.closed_threads = []
-        self.subthreads_owners = defaultdict(list)
 
     def start(self):
         """ Attempts to aquire the socket and launch the server """
@@ -75,18 +73,15 @@ class HelloServer:
 
         logging.info(f"Server successfully acquired the socket with port: {self.port}")
         logging.info("Press Ctrl+C to shut down the server and exit.")
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            logging.debug('STARTING WORKERS')
-            for _ in range(self.workers):
-                key = self._get_key()
-                worker_key = f'WORKER_{key}'
-                logging.info(f'Starting worker with key: {worker_key}')
-                executor.submit(self._listen, worker_key)
+        logging.debug('STARTING WORKERS')
+        for _ in range(self.workers):
+            key = self._get_key()
+            worker_key = f'WORKER_{key}'
+            logging.info(f'Starting worker with key: {worker_key}')
+            t = threading.Thread(target=self._listen, args=(worker_key,))
+            t.start()
+            self.opened_threads.append(t)
         logging.debug('WORKERS STARTED')
-        #  FIXME почему поток выполнения никогда не достигает этой строчки??
-        logging.info("BEHIND WITH")
-        # self._listen()
 
     def _get_key(self):
         return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(5))
@@ -99,11 +94,12 @@ class HelloServer:
             logging.debug(f'{worker_key}: ADDRESS: {address}')
             logging.debug(f'{worker_key}: SET TIMEOUT')
             client.settimeout(10)
-            key = self._get_key()
-            logging.info(f"{worker_key}: START NEW THREAD WITH KEY {key}")
-            threading.Thread(target = self.listen_to_client, args = (client, address,worker_key, key)).start()
-            self.opened_threads.append(key)
-            self.subthreads_owners[worker_key].append(key)
+            self.listen_to_client(client, address, worker_key, ' ')
+            # key = self._get_key()
+            # logging.info(f"{worker_key}: START NEW THREAD WITH KEY {key}")
+            # threading.Thread(target = self.listen_to_client, args = (client, address,worker_key, key)).start()
+            # self.opened_threads.append(key)
+            # self.subthreads_owners[worker_key].append(key)
 
     def listen_to_client(self, client, address, worker_key,  thread_key):
         logging.debug(f'{worker_key} : THREAD {thread_key} : STARTED NEW THREAD FOR {address}')
@@ -113,18 +109,15 @@ class HelloServer:
             logging.debug(f'{worker_key} : THREAD {thread_key} : DATA IS: {data}')
             if data:
                 response = self.get_response(data)
-                # client.send(response) TODO: как лучше?
                 client.sendall(response)
                 logging.info(f'{worker_key} : THREAD {thread_key} : RESPONSE SENDED, EXITING')
                 client.close()
-                self.closed_threads.append(thread_key)
                 return True
             else:
                 raise socket.error('Client disconnected')
         except OSError as e:
             logging.info(f'{worker_key} : THREAD {thread_key} : CLIENT DISCONNECTED, EXITING')
             client.close()
-            self.closed_threads.append(thread_key)
             return False
 
     def _read(self, client):
@@ -152,11 +145,6 @@ class HelloServer:
             exit_code = 1
 
         finally:
-            logging.info(f'Opened threads: {len(self.opened_threads)}')
-            logging.info(f'Closed threads: {len(self.closed_threads)}')
-            logging.info(f'Workers statistic: ')
-            for worker, threads in self.subthreads_owners.items():
-                logging.info(f'{worker} :: {len(threads)} threads.')
             sys.exit(exit_code)
 
 
@@ -165,28 +153,6 @@ class HTTPServer(HelloServer):
         self.document_root = document_root
         self.delimiter = b'\r\n'
         self.ender = b'\r\n\r\n'
-        # в настоящее время на каждое нажатие F5 в браузере сервер создает отдельный тред.
-        # и закрытия этих тредов что-то не видно. Есть параметр keep-alive, и вроде как если он есть
-        # соединение с этим браузером не должно отдаваться другому треду.
-        # непонятно как это реализовать. Пока ощущение, что плодиться куча тредов и они нихрена потом
-        # не закрываются нормально.
-        # Косвенно на это указывает тот факт, что при апач тесте процесс сервера потихонечку разрастается в памяти.
-        # Хотя посчитал статистику - вроде ничего
-        # [2018.04.27 17:07:09] I Opened threads: 49967
-        # [2018.04.27 17:07:09] I Closed threads: 49961
-        # а время на запрос пишет - 10 секунд, значит все запросы отваливаются по таймауту!
-        # значит надо закрывать тред после каждого ответа
-        # сразу стали запросы по 20 мс выполняться
-        # и треды закрываются, но все-таки не все:
-        # [2018.04.27 17: 34:47] I Opened threads: 49910
-        # [2018.04.27 17:34:47] I Closed threads: 49902
-
-        # кстати если убрать Thread Pool - то сервер при закрытии вообще будет зависать,
-        # по-крайней мере из пайчарма так.
-        # Сейчас получается что у меня воркер треды, которые создают еще треды.
-        # Нормально ли это вообще? :)
-        # Еще сервак тормозит на тесте HEAD - видимо ждет конца пакета?
-        # непонятно, что ему нужно отдавать. Или Content-Length = 0 писать?
         self.close_connection = True
         super().__init__(host, port, workers)
 
@@ -272,7 +238,7 @@ class HTTPServer(HelloServer):
         if '../' in path:
             return '', ''
         if '%' in path:
-            path = parse.unquote(path)
+            path = unquote(path)
         if path == '/':
             path = os.path.join(self.document_root, 'index.html')
         else:
