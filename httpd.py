@@ -90,9 +90,12 @@ class HelloServer:
     def _listen(self, worker_key):
         self.sock.listen(5)
         t = threading.currentThread()
-        while getattr(t, "run", True):
+        while True:
             logging.debug(f'{worker_key}: ACCEPTING')
-            client, address = self.sock.accept()
+            try:
+                client, address = self.sock.accept()
+            except OSError as e:
+                return False
             logging.debug(f'{worker_key}: ADDRESS: {address}')
             logging.debug(f'{worker_key}: SET TIMEOUT')
             client.settimeout(10)
@@ -140,12 +143,11 @@ class HelloServer:
         exit_code = 0
         try:
             logging.info("Shutting down the server")
+            self.sock.shutdown(socket.SHUT_RDWR)
             for th in threading.enumerate():
                 if th != threading.main_thread():
                     logging.info(f"JOINING THREAD{th.name}")
-                    th.run = False
                     th.join(2)
-            self.sock.shutdown(socket.SHUT_RDWR)
 
         except Exception as e:
             logging.info(f"Warning: could not shut down the socket. Maybe it was already closed? {e}")
