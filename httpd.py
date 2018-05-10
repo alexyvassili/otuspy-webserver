@@ -89,7 +89,8 @@ class HelloServer:
 
     def _listen(self, worker_key):
         self.sock.listen(5)
-        while True:
+        t = threading.currentThread()
+        while getattr(t, "run", True):
             logging.debug(f'{worker_key}: ACCEPTING')
             client, address = self.sock.accept()
             logging.debug(f'{worker_key}: ADDRESS: {address}')
@@ -139,6 +140,11 @@ class HelloServer:
         exit_code = 0
         try:
             logging.info("Shutting down the server")
+            for th in threading.enumerate():
+                if th != threading.main_thread():
+                    logging.info(f"JOINING THREAD{th.name}")
+                    th.run = False
+                    th.join(2)
             self.sock.shutdown(socket.SHUT_RDWR)
 
         except Exception as e:
